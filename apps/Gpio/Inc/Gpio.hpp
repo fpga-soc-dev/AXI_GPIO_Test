@@ -1,103 +1,110 @@
 #pragma once
 
-#include <chrono>
-#include <cstdint>
+#include <gpiod.hpp>
+
 #include <functional>
-#include <mutex>
 #include <thread>
-#include <termios.h>
-#include "FileHandle.hpp"
+#include <mutex>
 
-namespace UART
+namespace Gpio
 {
-    enum class BaudRate : uint32_t
+    enum class EdgeType
     {
-        BAUD_9600 = 9600,
-        BAUD_19200 = 19200,
-        BAUD_38400 = 38400,
-        BAUD_57600 = 57600,
-        BAUD_115200 = 115200,
-        BAUD_230400 = 230400
+        NONE,
+        RISING,
+        FALLING,
+        BOTH
     };
 
-    enum class DataBits : uint8_t
+    enum class Direction
     {
-        DATA_5 = 5,
-        DATA_6 = 6,
-        DATA_7 = 7,
-        DATA_8 = 8
+        INPUT,
+        OUTPUT
     };
 
-    enum class Parity : uint8_t
+    enum class Value : bool
     {
-        NONE = 0,
-        ODD = 1,
-        EVEN = 2
+        LOW = false,
+        HIGH = true
     };
 
-    struct UartConfig
+    using InterruptCallback = std::function<void(unsigned int pin, Value value, std::chrono::steady_clock::time_point timestamp)>;
+
+    struct InterruptConfig
     {
-        BaudRate baud_rate{BaudRate::BAUD_230400};
-        DataBits data_bits{DataBits::DATA_8};
-        Parity parity{Parity::NONE};
-        std::chrono::milliseconds read_timeout{2000};
-        std::chrono::milliseconds write_timeout{2000};
+        EdgeType edgeType{EdgeType::RISING};
+        std::chrono::milliseconds debouncePeriod{10};
+        InterruptCallback callback;
+        bool enabled{false};
     };
 
-    struct InterruptEvent
-    {
-        size_t bytes_available;
-        std::vector<uint8_t> data;
-    };
-
-    using InterruptCallback = std::function<void(const InterruptEvent &)>;
-
-    class UartDevice
+    class Gpio
     {
     public:
-        static constexpr uint8_t MESSAGE_DELIMITER = '\n';
+        static constexpr unsigned int OUTPUT_CHANNEL_START = 0;
+        static constexpr unsigned int OUTPUT_CHANNEL_END = 8;
+        static constexpr unsigned int INPUT_CHANNEL_START = 32;
+        static constexpr unsigned int INPUT_CHANNEL_END = 37;
+        static constexpr unsigned int TOTAL_PINS = 64;
 
-        explicit UartDevice(const std::string &device_path);
-        explicit UartDevice(const std::string &device_path, const UartConfig &config);
-        ~UartDevice();
+        Gpio(const std::string &chipPath);
+        ~Gpio();
 
-        UartDevice(const UartDevice &) = delete;
-        UartDevice &operator=(const UartDevice &) = delete;
-        UartDevice(UartDevice &&) noexcept;
-        UartDevice &operator=(UartDevice &&) noexcept;
+        Gpio(const Gpio &) = delete;
+        Gpio &operator=(const Gpio &) = delete;
+        Gpio(Gpio &&) noexcept;
+        Gpio &operator=(Gpio &&) noexcept;
 
-        void Configure(const UartConfig &config);
-        UartConfig GetConfig() const;
-        bool IsOpen() const;
+        void SetOutput(unsigned int pin, Value value);
+        void SetOutputs(const std::vector<std::pair<unsigned int, Value>> &pinValues);
+        void SetOutputMask(uint32_t mask, uint32_t values);
 
-        size_t Write(std::span<const uint8_t> data);
-        std::vector<uint8_t> Read(int timeout_ms = 5000);
+        Value GetInput(unsigned int pin);
+        std::vector<Value> GetInputs(const std::vector<unsigned int> &pins);
+        uint32_t GetInputMask(uint32_t mask = 0xFFFFFFFF);
 
-        void RegisterDataCallback(const InterruptCallback &callback);
-        void DisableInterrupts();
+        Value GetPinValue(unsigned int pin);
 
-        void Flush();
-        size_t BytesAvailable() const;
+        void EnableInterrupt(unsigned int pin, const InterruptConfig &config);
+        void DisableInterrupt(unsigned int pin);
+        void DisableAllInterrupts();
+
+        bool IsOutputPin(unsigned int pin) const noexcept;
+        bool IsInputPin(unsigned int pin) const noexcept;
+        bool IsValidPin(unsigned int pin) const noexcept;
 
     private:
-        std::unique_ptr<Utils::FileHandle> m_FileHandle;
-        std::string m_DevicePath;
-        UartConfig m_Config;
+        struct LineInfo
+        {
+            InterruptConfig config;
+            std::chrono::steady_clock::time_point lastEventTime;
+        };
+        std::string m_ChipPath;
+        gpiod::chip m_Chip;
 
-        // No memory leaks if constructor throws
-        // No abandoned threads if exceptions occur
-        // Automatic cleanup in destructor
-        // Cooperative cancellation with stop_token
-        // Exception-safe move operations
-        std::jthread m_InterruptThread;
-        std::atomic<bool> m_InterruptEnabled{false};
-        InterruptCallback m_InterruptCallback;
-        mutable std::mutex m_Mutex;
+        std::unique_ptr<gpiod::line_request> m_OutputRequest;
+        std::unique_ptr<gpiod::line_request> m_InputRequest;
+        std::shared_ptr<gpiod::line_request> m_EventRequest;
+        std::unordered_map<unsigned int, std::unique_ptr<LineInfo>> m_InterruptLines;
 
-        void ApplyConfig();
-        void InterruptHandler(std::stop_token stop_token);
+        mutable std::mutex m_GpioMutex;
 
-        void PrintTermiosSettings(const termios &tty) const;
-        std::string SpeedToBaudRate(speed_t speed) const;
+        std::jthread m_EventThread;
+        std::atomic<bool> m_Running{false};
+
+        void InitChip();
+        void Cleanup();
+        void StartEventMonitoring();
+        void StopEventMonitoring();
+        void EventMonitorLoop(std::stop_token stopToken);
+        void UpdateEventRequest();
+
+        void ValidateOutputPin(unsigned int pin) const;
+        void ValidateInputPin(unsigned int pin) const;
+        void EnsureOutputRequest();
+        void EnsureInputRequest();
+
+        bool ShouldProcessEvent(const LineInfo &lineInfo, std::chrono::steady_clock::time_point eventTime) const;
+        gpiod::line::edge ConvertEdgeType(EdgeType edgeType) const;
     };
-} // namespace UART
+}

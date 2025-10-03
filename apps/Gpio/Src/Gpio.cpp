@@ -1,542 +1,638 @@
-#include "UartDevice.hpp"
+#include "Gpio.hpp"
 
-#include <fcntl.h>
-#include <stdexcept>
-#include <vector>
-#include <unistd.h>
-#include <sys/ioctl.h>
-#include <sys/epoll.h>
-#include <poll.h>
-#include <cerrno>
-#include <cstring>
-#include <cmath>
-#include <fmt/core.h>
-#include <fmt/format.h>
-
-namespace UART
+namespace Gpio
 {
-    speed_t BaudRateToSpeed(BaudRate baud_rate)
+    Gpio::Gpio(const std::string &chip_name)
+        : m_ChipPath(chip_name), m_Chip(chip_name)
     {
-        switch (baud_rate)
-        {
-        case BaudRate::BAUD_9600:
-            return B9600;
-        case BaudRate::BAUD_19200:
-            return B19200;
-        case BaudRate::BAUD_38400:
-            return B38400;
-        case BaudRate::BAUD_57600:
-            return B57600;
-        case BaudRate::BAUD_115200:
-            return B115200;
-        case BaudRate::BAUD_230400:
-            return B230400;
-        default:
-            return B115200;
-        }
+        InitChip();
     }
 
-    // O_NOCTTY: This flag tells the system not to make the opened file (in this case, the UART device) the controlling terminal for the process.
-    // Without this flag, if your process opens a terminal device (like a UART), it could become the controlling terminal, which can lead to unexpected behavior (like receiving signals such as SIGINT from the terminal).
-    UartDevice::UartDevice(const std::string &device_path)
-        : m_DevicePath(device_path),
-          m_FileHandle(std::make_unique<Utils::FileHandle>(device_path, (O_RDWR | O_NOCTTY)))
+    Gpio::~Gpio()
     {
-        if (!m_FileHandle->IsOpen())
-        {
-            throw std::runtime_error("Failed to open UART device: " + device_path);
-        }
-        ApplyConfig();
+        StopEventMonitoring();
+        Cleanup();
     }
 
-    UartDevice::UartDevice(const std::string &device_path, const UartConfig &config)
-        : m_DevicePath(device_path),
-          m_Config(config),
-          m_FileHandle(std::make_unique<Utils::FileHandle>(device_path, (O_RDWR | O_NOCTTY)))
+    Gpio::Gpio(Gpio &&other) noexcept
+        : m_ChipPath(std::move(other.m_ChipPath)),
+          m_Chip(std::move(other.m_Chip)),
+          m_OutputRequest(std::move(other.m_OutputRequest)),
+          m_InputRequest(std::move(other.m_InputRequest)),
+          m_EventRequest(std::move(other.m_EventRequest)),
+          m_InterruptLines(std::move(other.m_InterruptLines)),
+          m_EventThread(std::move(other.m_EventThread)),
+          m_Running(other.m_Running.load())
     {
-        if (!m_FileHandle->IsOpen())
-        {
-            throw std::runtime_error("Failed to open UART device: " + device_path);
-        }
-        ApplyConfig();
+        other.m_Running.store(false);
+        other.m_OutputRequest.reset();
+        other.m_InputRequest.reset();
+        other.m_EventRequest.reset();
+        other.m_InterruptLines.clear();
     }
 
-    UartDevice::~UartDevice()
-    {
-        DisableInterrupts();
-    }
-
-    UartDevice::UartDevice(UartDevice &&other) noexcept
-        : m_FileHandle(std::move(other.m_FileHandle)),
-          m_DevicePath(std::move(other.m_DevicePath)),
-          m_Config(other.m_Config),
-          m_InterruptThread(std::move(other.m_InterruptThread)),
-          m_InterruptEnabled(other.m_InterruptEnabled.load()),
-          m_InterruptCallback(std::move(other.m_InterruptCallback))
-    {
-        other.m_InterruptEnabled.store(false);
-    }
-
-    UartDevice &UartDevice::operator=(UartDevice &&other) noexcept
+    Gpio &Gpio::operator=(Gpio &&other) noexcept
     {
         if (this != &other)
         {
-            DisableInterrupts();
+            StopEventMonitoring();
+            Cleanup();
 
-            m_FileHandle = std::move(other.m_FileHandle);
-            m_DevicePath = std::move(other.m_DevicePath);
-            m_Config = other.m_Config;
-            m_InterruptThread = std::move(other.m_InterruptThread);
-            m_InterruptEnabled.store(other.m_InterruptEnabled.load());
-            m_InterruptCallback = std::move(other.m_InterruptCallback);
+            m_ChipPath = std::move(other.m_ChipPath);
+            m_Chip = std::move(other.m_Chip);
+            m_OutputRequest = std::move(other.m_OutputRequest);
+            m_InputRequest = std::move(other.m_InputRequest);
+            m_EventRequest = std::move(other.m_EventRequest);
+            m_InterruptLines = std::move(other.m_InterruptLines);
+            m_EventThread = std::move(other.m_EventThread);
+            m_Running.store(other.m_Running.load());
 
-            other.m_InterruptEnabled.store(false);
+            other.m_Running.store(false);
+            other.m_OutputRequest.reset();
+            other.m_InputRequest.reset();
+            other.m_EventRequest.reset();
+            other.m_InterruptLines.clear();
         }
         return *this;
     }
 
-    void UartDevice::Configure(const UartConfig &config)
+    void Gpio::InitChip()
     {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        m_Config = config;
-        ApplyConfig();
-    }
-
-    UartConfig UartDevice::GetConfig() const
-    {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-        return m_Config;
-    }
-
-    bool UartDevice::IsOpen() const
-    {
-        return m_FileHandle && m_FileHandle->IsOpen();
-    }
-
-    size_t UartDevice::Write(std::span<const uint8_t> data)
-    {
-        if (!IsOpen())
+        try
         {
-            throw std::runtime_error("UART device not open");
-        }
-
-        if (data.empty())
-        {
-            return 0;
-        }
-
-        size_t total_written = 0;
-        constexpr size_t MAX_CHUNK_SIZE = 16; // AXI UART FIFO size
-
-        while (total_written < data.size())
-        {
-            size_t remaining = data.size() - total_written;
-            size_t chunk_size = std::min(remaining, MAX_CHUNK_SIZE);
-
-            ssize_t bytes_written = m_FileHandle->Write(data.data() + total_written, chunk_size);
-
-            if (bytes_written > 0)
+            if (m_Chip.get_info().num_lines() < TOTAL_PINS)
             {
-                total_written += static_cast<size_t>(bytes_written);
-            }
-            else if (bytes_written == 0)
-            {
-                throw std::runtime_error("UART write returned 0 bytes");
-            }
-            else
-            {
-                if (errno == EINTR)
-                {
-                    continue;
-                }
-                else if (errno == EAGAIN || errno == EWOULDBLOCK)
-                {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-                else
-                {
-                    throw std::runtime_error("UART write failed: " + std::string(strerror(errno)));
-                }
+                throw std::runtime_error("GPIO chip has fewer number of lines" + std::to_string(m_Chip.get_info().num_lines()) +
+                                         " than required " + std::to_string(TOTAL_PINS));
             }
         }
-
-        return total_written;
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to open GPIO chip: " + std::string(e.what()));
+        }
     }
 
-    std::vector<uint8_t> UartDevice::Read(int timeout_ms)
+    void Gpio::Cleanup()
     {
-        std::vector<uint8_t> data;
-        constexpr size_t CHUNK_SIZE = 4096;
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
 
-        struct pollfd pfd = {
-            .fd = m_FileHandle->GetFd(),
-            .events = POLLIN,
-            .revents = 0};
+        m_InterruptLines.clear();
+        m_EventRequest.reset();
+        m_InputRequest.reset();
+        m_OutputRequest.reset();
+    }
 
-        while (true)
+    void Gpio::StartEventMonitoring()
+    {
+        if (m_Running.load())
         {
-            int poll_result = ::poll(&pfd, 1, timeout_ms);
+            return;
+        }
 
-            if (poll_result < 0)
+        m_Running.store(true);
+        m_EventThread = std::jthread([this](std::stop_token stopToken)
+                                     { EventMonitorLoop(stopToken); });
+    }
+
+    void Gpio::StopEventMonitoring()
+    {
+        if (!m_Running.load())
+        {
+            return;
+        }
+
+        m_Running.store(false);
+        if (m_EventThread.joinable())
+        {
+            m_EventThread.request_stop();
+            m_EventThread.join();
+        }
+    }
+
+    void Gpio::EventMonitorLoop(std::stop_token stopToken)
+    {
+        constexpr auto timeout = std::chrono::milliseconds(100);
+
+        while (m_Running.load() && !stopToken.stop_requested())
+        {
+            try
             {
-                if (errno == EINTR)
+                std::shared_ptr<gpiod::line_request> event_request;
                 {
-                    continue;
-                }
-                throw std::runtime_error("Poll failed: " + std::string(strerror(errno)));
-            }
-
-            if (poll_result == 0)
-            {
-                // Timeout - if we have data without delimiter, return it anyway
-                if (!data.empty())
-                {
-                    break;
-                }
-                continue;
-            }
-
-            if (pfd.revents & POLLIN)
-            {
-                size_t bytes_available = BytesAvailable();
-                if (bytes_available > 0)
-                {
-                    size_t to_read = std::min(bytes_available, CHUNK_SIZE);
-                    std::vector<uint8_t> buffer(to_read);
-
-                    // Block until we read some data during timeout period
-                    ssize_t bytes_read = m_FileHandle->Read(buffer.data(), buffer.size());
-
-                    if (bytes_read > 0)
+                    std::lock_guard<std::mutex> lock(m_GpioMutex);
+                    if (!m_EventRequest || m_InterruptLines.empty())
                     {
-                        buffer.resize(static_cast<size_t>(bytes_read));
-                        data.insert(data.end(), buffer.begin(), buffer.end());
-
-                        if (std::find(buffer.begin(), buffer.end(), MESSAGE_DELIMITER) != buffer.end())
-                        {
-                            break;
-                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        continue;
                     }
-                    else if (bytes_read < 0)
-                    {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                        {
-                            continue;
-                        }
-                        throw std::runtime_error("Read failed: " + std::string(strerror(errno)));
-                    }
-                    else
-                    {
-                        break;
-                    }
+                    event_request = m_EventRequest;
                 }
-            }
 
-            if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
-            {
-                break;
-            }
-
-            pfd.revents = 0;
-        }
-
-        return data;
-    }
-
-    void UartDevice::RegisterDataCallback(const InterruptCallback &callback)
-    {
-        std::lock_guard<std::mutex> lock(m_Mutex);
-
-        if (m_InterruptEnabled.load())
-        {
-            throw std::runtime_error("Interrupts already enabled");
-        }
-
-        if (m_InterruptCallback)
-        {
-            throw std::runtime_error("Callback already registered");
-        }
-
-        m_InterruptCallback = callback;
-        m_InterruptEnabled.store(true);
-
-        if (!m_InterruptThread.joinable())
-        {
-            m_InterruptThread = std::jthread([this](std::stop_token token)
-                                             { InterruptHandler(token); });
-        }
-    }
-
-    void UartDevice::DisableInterrupts()
-    {
-        m_InterruptEnabled.store(false);
-        if (m_InterruptThread.joinable())
-        {
-            m_InterruptThread.request_stop();
-            m_InterruptThread.join();
-        }
-    }
-
-    void UartDevice::Flush()
-    {
-        if (!IsOpen())
-        {
-            throw std::runtime_error("UART device not open");
-        }
-        tcflush(m_FileHandle->GetFd(), TCIOFLUSH); // Flush both buffers (
-    }
-
-    size_t UartDevice::BytesAvailable() const
-    {
-        if (!IsOpen())
-        {
-            throw std::runtime_error("UART device not open");
-        }
-
-        // Use ioctl to get the number of bytes available for reading
-        int bytes_available = 0;
-        if (ioctl(m_FileHandle->GetFd(), FIONREAD, &bytes_available) == 0)
-        {
-            return static_cast<size_t>(bytes_available);
-        }
-        return 0;
-    }
-
-    void UartDevice::ApplyConfig()
-    {
-        if (m_FileHandle->GetFd() < 0)
-        {
-            throw std::runtime_error("UART device not open");
-        }
-
-        // Get current terminal attributes before modification
-        struct termios tty;
-        if (tcgetattr(m_FileHandle->GetFd(), &tty) != 0)
-        {
-            throw std::runtime_error("Failed to get UART attributes");
-        }
-
-        // Both TX and RX are configured for m_Config.baud_rate bits per second
-        speed_t speed = BaudRateToSpeed(m_Config.baud_rate);
-        cfsetospeed(&tty, speed);
-        cfsetispeed(&tty, speed);
-
-        // Configure data bits
-        tty.c_cflag &= ~CSIZE;
-        switch (m_Config.data_bits)
-        {
-        case DataBits::DATA_5:
-            tty.c_cflag |= CS5;
-            break;
-        case DataBits::DATA_6:
-            tty.c_cflag |= CS6;
-            break;
-        case DataBits::DATA_7:
-            tty.c_cflag |= CS7;
-            break;
-        case DataBits::DATA_8:
-            tty.c_cflag |= CS8;
-            break;
-        default:
-            tty.c_cflag |= CS8;
-            break;
-        }
-        // Configure parity
-        switch (m_Config.parity)
-        {
-        case Parity::NONE:
-            tty.c_cflag &= ~PARENB;
-            break;
-        case Parity::ODD:
-            tty.c_cflag |= PARENB;
-            tty.c_cflag |= PARODD;
-            break;
-        case Parity::EVEN:
-            tty.c_cflag |= PARENB;
-            tty.c_cflag &= ~PARODD;
-            break;
-        default:
-            tty.c_cflag &= ~PARENB;
-            break;
-        }
-
-        tty.c_cflag &= ~CSTOPB;                                                      // Set 1 stop bit (clear CSTOPB flag)
-        tty.c_cflag |= (CLOCAL | CREAD);                                             // Enable local mode and receiver
-        tty.c_cflag &= ~CRTSCTS;                                                     // Disable hardware flow control (RTS/CTS)
-        tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);                              // Disable line processing features
-        tty.c_iflag &= ~(IXON | IXOFF | IXANY);                                      // Disable software flow control (XON/XOFF)
-        tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL); // Disable input processing
-        tty.c_oflag &= ~OPOST;                                                       // Disable output processing
-        tty.c_cc[VTIME] = 0;                                                         // Set read timeout (deciseconds)
-        tty.c_cc[VMIN] = 0;                                                          // Set minimum characters for read (0 = non-blocking with timeout)
-
-        if (tcsetattr(m_FileHandle->GetFd(), TCSANOW, &tty) != 0)
-        {
-            throw std::runtime_error("Failed to set terminal attributes");
-        }
-
-        PrintTermiosSettings(tty);
-    }
-
-    void UartDevice::InterruptHandler(std::stop_token token)
-    {
-        int epoll_fd = epoll_create1(0); // create epoll instance for monitoring UART fd
-        if (epoll_fd == -1)
-        {
-            throw std::runtime_error("Failed to create epoll instance");
-        }
-
-        struct epoll_event event;
-        event.events = EPOLLIN;                // Monitor for read availability
-        event.data.fd = m_FileHandle->GetFd(); // Store the UART fd in event data
-
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, m_FileHandle->GetFd(), &event) == -1)
-        {
-            close(epoll_fd);
-            throw std::runtime_error("Failed to add UART fd to epoll");
-        }
-
-        struct epoll_event events[1];
-        std::vector<uint8_t> accumulated_data;
-
-        while (!token.stop_requested() && m_InterruptEnabled.load())
-        {
-            // Wait for data without timeout - we rely on delimiter for message boundaries
-            int nfds = epoll_wait(epoll_fd, events, 1, 100); // Short timeout for responsiveness
-
-            if (nfds == -1)
-            {
-                if (errno == EINTR)
+                // wait for interrupts from kernel, with timeout to check m_Running periodically
+                if (event_request && event_request->wait_edge_events(timeout))
                 {
-                    continue;
-                }
-                break; // Error occurred
-            }
-
-            if (nfds > 0 && (events[0].events & EPOLLIN))
-            {
-                try
-                {
-                    // Read all immediately available data
-                    auto new_data = Read();
-                    if (!new_data.empty())
+                    // Creates a buffer to hold up to 16 events at a time
+                    gpiod::edge_event_buffer buffer(16);
+                    // Read all available events into the buffer
+                    auto num_events = event_request->read_edge_events(buffer);
+                    for (size_t i = 0; i < num_events; ++i)
                     {
-                        accumulated_data.insert(accumulated_data.end(), new_data.begin(), new_data.end());
+                        // Process each event
+                        const auto &event = buffer.get_event(i);
+                        // record the time of the event to handle debounce
+                        auto event_time = std::chrono::steady_clock::now();
+                        // Get the pin number that triggered the event
+                        auto pin = event.line_offset();
 
-                        // Check if we have complete message(s) with delimiter
-                        auto delimiter_pos = std::find(accumulated_data.begin(), accumulated_data.end(), MESSAGE_DELIMITER);
+                        // Protects access to m_InterruptLines. Multi-threaded access possible m_InterruptLines simultaneously.
+                        std::lock_guard<std::mutex> interrupt_lock(m_GpioMutex);
+                        // Find the corresponding interrupt configuration
+                        auto it = m_InterruptLines.find(pin);
 
-                        while (delimiter_pos != accumulated_data.end())
+                        // If the pin is found and interrupt enabled, process the event
+                        if (it != m_InterruptLines.end() &&
+                            it->second->config.enabled &&
+                            ShouldProcessEvent(*it->second, event_time)) // Check for debounce
                         {
-                            // Extract complete message (including delimiter)
-                            size_t message_length = std::distance(accumulated_data.begin(), delimiter_pos) + 1;
-                            std::vector<uint8_t> complete_message(accumulated_data.begin(), accumulated_data.begin() + message_length);
-
-                            // Send the complete message via callback
-                            if (m_InterruptCallback)
+                            // Update the last event time for debounce tracking
+                            it->second->lastEventTime = event_time;
+                            // Call the user-defined callback function
+                            auto callback = it->second->config.callback;
+                            // Determine the event value (RISING or FALLING)
+                            Value value = static_cast<Value>(event.type() == gpiod::edge_event::event_type::RISING_EDGE);
+                            if (callback)
                             {
-                                InterruptEvent interrupt_event{complete_message.size(), std::move(complete_message)};
-                                m_InterruptCallback(interrupt_event);
+                                callback(pin, value, event_time);
                             }
-
-                            // Remove processed message from buffer
-                            accumulated_data.erase(accumulated_data.begin(), accumulated_data.begin() + message_length);
-
-                            // Check for more complete messages
-                            delimiter_pos = std::find(accumulated_data.begin(), accumulated_data.end(), MESSAGE_DELIMITER);
                         }
                     }
                 }
-                catch (const std::exception &e)
+            }
+            catch (const std::system_error &e)
+            {
+                throw std::runtime_error("Event monitoring thread error: " + std::string(e.what()));
+            }
+        }
+    }
+
+    void Gpio::SetOutput(unsigned int pin, Value value)
+    {
+        ValidateOutputPin(pin);
+
+        std::unique_lock<std::mutex> lock(m_GpioMutex);
+        EnsureOutputRequest();
+
+        try
+        {
+            gpiod::line::value gpioValue = (value == Value::HIGH) ? gpiod::line::value::ACTIVE : gpiod::line::value::INACTIVE;
+            m_OutputRequest->set_value(pin, gpioValue);
+        }
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to set GPIO output: " + std::string(e.what()));
+        }
+    }
+
+    void Gpio::SetOutputs(const std::vector<std::pair<unsigned int, Value>> &pinValues)
+    {
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        EnsureOutputRequest();
+        std::vector<gpiod::line::offset> offsets;
+        std::vector<gpiod::line::value> values;
+
+        for (const auto &[pin, value] : pinValues)
+        {
+            ValidateOutputPin(pin);
+            offsets.push_back(pin);
+            gpiod::line::value gpioValue = (value == Value::HIGH) ? gpiod::line::value::ACTIVE : gpiod::line::value::INACTIVE;
+            values.push_back(gpioValue);
+        }
+
+        try
+        {
+            m_OutputRequest->set_values(offsets, values);
+        }
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to set GPIO outputs: " + std::string(e.what()));
+        }
+    }
+
+    void Gpio::SetOutputMask(uint32_t mask, uint32_t values)
+    {
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        EnsureOutputRequest();
+
+        std::vector<gpiod::line::offset> offsets;
+        std::vector<gpiod::line::value> gpio_values;
+
+        for (unsigned int i = OUTPUT_CHANNEL_START; i <= OUTPUT_CHANNEL_END; ++i)
+        {
+            if (mask & (1u << i))
+            {
+                offsets.push_back(i);
+                gpiod::line::value value = (values & (1u << i)) ? gpiod::line::value::ACTIVE : gpiod::line::value::INACTIVE;
+                gpio_values.push_back(value);
+            }
+        }
+
+        try
+        {
+            m_OutputRequest->set_values(offsets, gpio_values);
+        }
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to set GPIO output mask: " + std::string(e.what()));
+        }
+    }
+
+    Value Gpio::GetInput(unsigned int pin)
+    {
+        ValidateInputPin(pin);
+
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        EnsureInputRequest();
+
+        try
+        {
+            auto value = m_InputRequest->get_value(pin);
+            return (value == gpiod::line::value::ACTIVE) ? Value::HIGH : Value::LOW;
+        }
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to get GPIO input: " + std::string(e.what()));
+        }
+    }
+
+    std::vector<Value> Gpio::GetInputs(const std::vector<unsigned int> &pins)
+    {
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        EnsureInputRequest();
+
+        std::vector<gpiod::line::offset> offsets;
+        for (unsigned int pin : pins)
+        {
+            ValidateInputPin(pin);
+            offsets.push_back(pin);
+        }
+
+        try
+        {
+            auto values = m_InputRequest->get_values(offsets);
+            std::vector<Value> results;
+            results.reserve(values.size());
+
+            for (const auto &value : values)
+            {
+                results.emplace_back(static_cast<Value>(value == gpiod::line::value::ACTIVE));
+            }
+
+            return results;
+        }
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to get GPIO inputs: " + std::string(e.what()));
+        }
+    }
+
+    uint32_t Gpio::GetInputMask(uint32_t mask)
+    {
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        EnsureInputRequest();
+
+        std::vector<gpiod::line::offset> offsets;
+        std::vector<unsigned int> bit_positions;
+
+        for (unsigned int i = INPUT_CHANNEL_START; i <= INPUT_CHANNEL_END; ++i)
+        {
+            unsigned int bit_pos = i - INPUT_CHANNEL_START;
+            if (mask & (1U << bit_pos))
+            {
+                offsets.push_back(i);
+                bit_positions.push_back(bit_pos);
+            }
+        }
+
+        try
+        {
+            if (offsets.empty())
+            {
+                return 0;
+            }
+
+            auto values = m_InputRequest->get_values(offsets);
+            uint32_t result = 0;
+
+            for (size_t i = 0; i < values.size(); ++i)
+            {
+                if (values[i] == gpiod::line::value::ACTIVE)
                 {
-                    // Handle errors - send empty event to signal error
-                    if (m_InterruptCallback)
-                    {
-                        InterruptEvent interrupt_event{0, {}};
-                        m_InterruptCallback(interrupt_event);
-                    }
-                    accumulated_data.clear();
-                    continue;
+                    result |= (1U << bit_positions[i]);
                 }
             }
 
-            // Handle epoll errors
-            if (nfds > 0 && (events[0].events & (EPOLLERR | EPOLLHUP)))
+            return result;
+        }
+        catch (const std::system_error &e)
+        {
+            throw std::runtime_error("Failed to get GPIO input mask: " + std::string(e.what()));
+        }
+    }
+
+    Value Gpio::GetPinValue(unsigned int pin)
+    {
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+
+        if (IsOutputPin(pin))
+        {
+            EnsureOutputRequest();
+            try
             {
-                break; // Connection error
+                auto value = m_OutputRequest->get_value(pin);
+                return static_cast<Value>(value);
+            }
+            catch (const std::system_error &e)
+            {
+                throw std::runtime_error("Failed to get output value for pin " + std::to_string(pin) + ": " + e.what());
             }
         }
-
-        close(epoll_fd);
-    }
-
-    void UartDevice::PrintTermiosSettings(const struct termios &tty) const
-    {
-        fmt::print("---UART Settings---\n");
-
-        // Baud rate
-        speed_t ispeed = cfgetispeed(&tty);
-        speed_t ospeed = cfgetospeed(&tty);
-        fmt::print("Input Baud: {}, Output Baud: {}\n", SpeedToBaudRate(ispeed), SpeedToBaudRate(ospeed));
-
-        // Control flags
-        fmt::print("c_cflag: 0x{:08X}\n", tty.c_cflag);
-        fmt::print("  Data bits: {}\n", (tty.c_cflag & CSIZE) == CS5 ? "5" : (tty.c_cflag & CSIZE) == CS6 ? "6"
-                                                                         : (tty.c_cflag & CSIZE) == CS7   ? "7"
-                                                                         : (tty.c_cflag & CSIZE) == CS8   ? "8"
-                                                                                                          : "Unknown");
-        fmt::print("  Parity: {}\n", (tty.c_cflag & PARENB) ? ((tty.c_cflag & PARODD) ? "ODD" : "EVEN") : "NONE");
-        fmt::print("  Stop bits: {}\n", (tty.c_cflag & CSTOPB) ? "2" : "1");
-        fmt::print("  Flow control: {}\n", (tty.c_cflag & CRTSCTS) ? "RTS/CTS" : "NONE");
-        fmt::print("  Local/Read: CLOCAL={}, CREAD={}\n",
-                   (tty.c_cflag & CLOCAL) ? "ON" : "OFF",
-                   (tty.c_cflag & CREAD) ? "ON" : "OFF");
-
-        // Local flags
-        fmt::print("c_lflag: 0x{:08X}\n", tty.c_lflag);
-        fmt::print("  Canonical: {}\n", (tty.c_lflag & ICANON) ? "ON" : "OFF");
-        fmt::print("  Echo: {}\n", (tty.c_lflag & ECHO) ? "ON" : "OFF");
-        fmt::print("  Signals: {}\n", (tty.c_lflag & ISIG) ? "ON" : "OFF");
-
-        // Input flags
-        fmt::print("c_iflag: 0x{:08X}\n", tty.c_iflag);
-        fmt::print("  XON/XOFF: {}\n", (tty.c_iflag & (IXON | IXOFF)) ? "ON" : "OFF");
-        fmt::print("  CR/LF conversion: INLCR={}, IGNCR={}, ICRNL={}\n",
-                   (tty.c_iflag & INLCR) ? "ON" : "OFF",
-                   (tty.c_iflag & IGNCR) ? "ON" : "OFF",
-                   (tty.c_iflag & ICRNL) ? "ON" : "OFF");
-
-        // Output flags
-        fmt::print("c_oflag: 0x{:08X}\n", tty.c_oflag);
-        fmt::print("  Output processing: {}\n", (tty.c_oflag & OPOST) ? "ON" : "OFF");
-
-        // Control characters
-        fmt::print("VMIN: {}, VTIME: {} ({}ms)\n",
-                   tty.c_cc[VMIN], tty.c_cc[VTIME], tty.c_cc[VTIME] * 100);
-
-        fmt::print("\n");
-    }
-
-    std::string UartDevice::SpeedToBaudRate(speed_t speed) const
-    {
-        switch (speed)
+        else if (IsInputPin(pin))
         {
-        case B9600:
-            return "9600";
-        case B19200:
-            return "19200";
-        case B38400:
-            return "38400";
-        case B57600:
-            return "57600";
-        case B115200:
-            return "115200";
-        case B230400:
-            return "230400";
-        default:
-            return fmt::format("Unknown({})", speed);
+            EnsureInputRequest();
+            try
+            {
+                auto value = m_InputRequest->get_value(pin);
+                return static_cast<Value>(value);
+            }
+            catch (const std::system_error &e)
+            {
+                throw std::runtime_error("Failed to get input value for pin " + std::to_string(pin) + ": " + e.what());
+            }
+        }
+        else
+        {
+            throw std::out_of_range("Pin " + std::to_string(pin) + " is not a valid GPIO pin.");
         }
     }
 
-} // namespace UART
+    void Gpio::EnableInterrupt(unsigned int pin, const InterruptConfig &config)
+    {
+        ValidateInputPin(pin);
+
+        if (!config.callback)
+        {
+            throw std::invalid_argument("Interrupt callback must be provided.");
+        }
+
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+
+        auto lineInfo = std::make_unique<LineInfo>();
+        lineInfo->config = config;
+        lineInfo->lastEventTime = std::chrono::steady_clock::now();
+
+        m_InterruptLines[pin] = std::move(lineInfo);
+
+        UpdateEventRequest();
+
+        if (!m_Running.load())
+        {
+            StartEventMonitoring();
+        }
+    }
+
+    void Gpio::DisableInterrupt(unsigned int pin)
+    {
+        ValidateInputPin(pin);
+
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        auto it = m_InterruptLines.find(pin);
+        if (it != m_InterruptLines.end())
+        {
+
+            m_InterruptLines.erase(it);
+
+            try
+            {
+                UpdateEventRequest();
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "Warning: Failed to update event request after disabling pin "
+                          << pin << ": " << e.what() << std::endl;
+
+                m_EventRequest.reset();
+            }
+        }
+    }
+
+    void Gpio::DisableAllInterrupts()
+    {
+        std::lock_guard<std::mutex> lock(m_GpioMutex);
+        m_InterruptLines.clear();
+        m_EventRequest.reset();
+    }
+
+    void Gpio::ValidateOutputPin(unsigned int pin) const
+    {
+        if (pin < OUTPUT_CHANNEL_START || pin > OUTPUT_CHANNEL_END)
+        {
+            throw std::out_of_range("Pin " + std::to_string(pin) + " is not a valid output pin.");
+        }
+    }
+
+    void Gpio::ValidateInputPin(unsigned int pin) const
+    {
+        if (pin < INPUT_CHANNEL_START || pin > INPUT_CHANNEL_END)
+        {
+            throw std::out_of_range("Pin " + std::to_string(pin) + " is not a valid input pin.");
+        }
+    }
+
+    void Gpio::UpdateEventRequest()
+    {
+        m_EventRequest.reset();
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+        if (m_InterruptLines.empty())
+        {
+            return;
+        }
+
+        try
+        {
+            // Create a vector of offsets for lines that need pin monitoring
+            std::vector<gpiod::line::offset> event_offsets;
+            // Hardware configuration for event monitoring
+            gpiod::line_config event_config;
+
+            for (const auto &[pin, line_info] : m_InterruptLines)
+            {
+                // Only add lines that are enabled and have a valid edge type
+                if (line_info->config.enabled && line_info->config.edgeType != EdgeType::NONE)
+                {
+                    // Add the pin to the list of offsets to monitor
+                    event_offsets.push_back(pin);
+                    // Configure line settings for the pin
+                    gpiod::line_settings event_settings;
+                    // Set the line as input for event detection
+                    event_settings.set_direction(gpiod::line::direction::INPUT);
+                    // Set the edge detection type based on user configuration
+                    event_settings.set_edge_detection(ConvertEdgeType(line_info->config.edgeType));
+                    // Add the configured settings for this pin to the overall event configuration
+                    event_config.add_line_settings(pin, event_settings);
+                }
+            }
+            // If there are any lines to monitor, create the event request
+            if (!event_offsets.empty())
+            {
+                // Use chip's prepare_request method (correct for libgpiod 2.x)
+                auto request_builder = m_Chip.prepare_request();
+                // Set a consumer label for identification
+                request_builder.set_consumer("AXI_GPIO_Events");
+                // Apply the event line configuration to the request
+                request_builder.set_line_config(event_config);
+                // Execute the request to obtain a line_request object
+                // Kernel allocate GPIO lines to reserve pins for event monitoring
+                // Hardware interrupt setup, GPIO controller configured for edge detection
+                // No other program can use these lines until released. If in use, throws exception
+                auto line_request = request_builder.do_request();
+                // Store the line_request in a shared_ptr for event monitoring
+                m_EventRequest = std::make_shared<gpiod::line_request>(std::move(line_request));
+            }
+        }
+        catch (const std::system_error &e)
+        {
+            std::cerr << "Failed to update event request: " << e.what() << std::endl;
+            m_EventRequest.reset();
+        }
+    }
+
+    void Gpio::EnsureOutputRequest()
+    {
+        if (!m_OutputRequest)
+        {
+            try
+            {
+                // Create list of output pins
+                std::vector<gpiod::line::offset> output_offsets;
+                output_offsets.reserve(OUTPUT_CHANNEL_END - OUTPUT_CHANNEL_START + 1);
+                for (unsigned int i = OUTPUT_CHANNEL_START; i <= OUTPUT_CHANNEL_END; ++i)
+                {
+                    output_offsets.push_back(static_cast<gpiod::line::offset>(i));
+                }
+
+                // Create line settings for outputs
+                gpiod::line_settings output_settings;
+                // Set direction to output and initial value to low
+                output_settings.set_direction(gpiod::line::direction::OUTPUT);
+                output_settings.set_output_value(gpiod::line::value::INACTIVE);
+
+                // Apply same settings to all output pins
+                gpiod::line_config output_config;
+                output_config.add_line_settings(output_offsets, output_settings);
+
+                // Creates request builder for GPIO chip
+                auto request_builder = m_Chip.prepare_request();
+                // Resource tracking label in kernel GPIO debugfs
+                request_builder.set_consumer("AXI_GPIO_Output");
+                // Tells kernel how to configure pins, as a bulk configuration
+                request_builder.set_line_config(output_config);
+                // Kernel interaction, syscall to GPIO subsystem
+                // Hardware configuration for output pins
+                // Pins are exclusively reserved for this process
+                auto line_request = request_builder.do_request();
+                m_OutputRequest = std::make_unique<gpiod::line_request>(std::move(line_request));
+            }
+            catch (const std::system_error &e)
+            {
+                throw std::runtime_error("Failed to create output request: " + std::string(e.what()));
+            }
+        }
+    }
+
+    void Gpio::EnsureInputRequest()
+    {
+        if (!m_InputRequest)
+        {
+            try
+            {
+
+                std::vector<gpiod::line::offset> input_offsets;
+                input_offsets.reserve(INPUT_CHANNEL_END - INPUT_CHANNEL_START + 1);
+                for (unsigned int i = INPUT_CHANNEL_START; i <= INPUT_CHANNEL_END; ++i)
+                {
+                    input_offsets.push_back(static_cast<gpiod::line::offset>(i));
+                }
+
+                gpiod::line_settings input_settings;
+                input_settings.set_direction(gpiod::line::direction::INPUT);
+
+                gpiod::line_config input_config;
+                input_config.add_line_settings(input_offsets, input_settings);
+
+                auto request_builder = m_Chip.prepare_request();
+                request_builder.set_consumer("AXI_GPIO_Input");
+                request_builder.set_line_config(input_config);
+
+                auto line_request = request_builder.do_request();
+                m_InputRequest = std::make_unique<gpiod::line_request>(std::move(line_request));
+            }
+            catch (const std::system_error &e)
+            {
+                throw std::runtime_error("Failed to create input request: " + std::string(e.what()));
+            }
+        }
+    }
+
+    bool Gpio::ShouldProcessEvent(const LineInfo &lineInfo, std::chrono::steady_clock::time_point eventTime) const
+    {
+        // Button Press Signal (without debouncing):
+        // Time:  0ms    5ms   10ms   15ms   20ms   25ms   30ms
+        // Signal:LOW → HIGH → LOW → HIGH → LOW → HIGH → HIGH
+        //        ↑     ↑      ↑     ↑      ↑     ↑      ↑
+        //        |     |      |     |      |     |      |
+        //      Press Bounce Bounce Bounce Bounce Bounce Stable
+        // Without debouncing: 6 interrupts generated for 1 button press!
+        // With debouncing: Only 1 interrupt processed
+
+        // const LineInfo &lineInfo        - Contains interrupt config + last event timestamp
+        // std::chrono::steady_clock::time_point eventTime  - When current event occurred
+        auto timeSinceLastEvent = eventTime - lineInfo.lastEventTime;
+        // Threshold time - has enough time passed?
+        // each pin can have different debounce periods
+        // Boolean result: true = process event, false = ignore event
+        return timeSinceLastEvent >= lineInfo.config.debouncePeriod;
+    }
+
+    gpiod::line::edge Gpio::ConvertEdgeType(EdgeType edgeType) const
+    {
+        switch (edgeType)
+        {
+        case EdgeType::RISING:
+            return gpiod::line::edge::RISING;
+        case EdgeType::FALLING:
+            return gpiod::line::edge::FALLING;
+        case EdgeType::BOTH:
+            return gpiod::line::edge::BOTH;
+        case EdgeType::NONE:
+        default:
+            return gpiod::line::edge::NONE;
+        }
+    }
+
+    bool Gpio::IsOutputPin(unsigned int pin) const noexcept
+    {
+        return pin >= OUTPUT_CHANNEL_START && pin <= OUTPUT_CHANNEL_END;
+    }
+
+    bool Gpio::IsInputPin(unsigned int pin) const noexcept
+    {
+        return pin >= INPUT_CHANNEL_START && pin <= INPUT_CHANNEL_END;
+    }
+
+    bool Gpio::IsValidPin(unsigned int pin) const noexcept
+    {
+        return pin < TOTAL_PINS;
+    }
+}

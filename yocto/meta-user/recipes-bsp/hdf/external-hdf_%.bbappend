@@ -1,4 +1,4 @@
 FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
 
-SRC_URI:append = " file://system-user.dtsi"
+HDF_URI = "file://pynq_z1_top.xsa"
 
